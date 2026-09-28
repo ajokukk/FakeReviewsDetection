@@ -1,0 +1,136 @@
+import streamlit as st
+import torch
+import torch.nn as nn
+import json
+import re
+import string
+
+# ==========================================
+# 1. Configuration & Model Architecture
+# ==========================================
+# These must match exactly what you used during training
+EMBEDDING_DIM = 50
+MAX_SEQ_LENGTH = 150
+HIDDEN_DIM = 128
+NUM_LAYERS = 2
+DROPOUT = 0.5
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class DeceptiveReviewLSTM(nn.Module):
+    def __init__(self, embedding_matrix, hidden_dim, num_layers, dropout):
+        super(DeceptiveReviewLSTM, self).__init__()
+        
+        embed_dim = embedding_matrix.size(1)
+        # We load the weights later, so freeze=False doesn't matter for inference
+        self.embedding = nn.Embedding.from_pretrained(embedding_matrix, freeze=False) 
+        
+        self.lstm = nn.LSTM(
+            input_size=embed_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=True 
+        )
+        
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_dim * 2, 1) 
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        embedded = self.embedding(x)
+        lstm_out, _ = self.lstm(embedded)
+        out = lstm_out[:, -1, :] 
+        out = self.dropout(out)
+        out = self.fc(out)
+        return self.sigmoid(out).squeeze()
+
+# ==========================================
+# 2. Helper Functions
+# ==========================================
+def clean_text(text):
+    text = str(text).lower() 
+    text = re.sub(f'[{re.escape(string.punctuation)}]', '', text) 
+    text = re.sub(r'\s+', ' ', text).strip() 
+    return text
+
+@st.cache_resource
+def load_model_and_vocab():
+    # Load Vocabulary
+    try:
+        with open('vocab.json', 'r') as f:
+            vocab = json.load(f)
+    except FileNotFoundError:
+        st.error("Could not find 'vocab.json'. Please run your training script first.")
+        return None, None
+
+    # Create a dummy embedding matrix to initialize the model structure
+    # The actual trained weights will be loaded from the .pth file
+    vocab_size = len(vocab)
+    dummy_matrix = torch.zeros((vocab_size, EMBEDDING_DIM))
+    
+    # Initialize Model
+    model = DeceptiveReviewLSTM(dummy_matrix, HIDDEN_DIM, NUM_LAYERS, DROPOUT).to(DEVICE)
+    
+    # Load Trained Weights
+    try:
+        model.load_state_dict(torch.load('best_model.pth', map_location=DEVICE))
+        model.eval()
+    except FileNotFoundError:
+        st.error("Could not find 'best_model.pth'. Please run your training script first.")
+        return None, None
+
+    return model, vocab
+
+def predict_review(text, model, vocab):
+    cleaned = clean_text(text)
+    tokens = cleaned.split()
+    
+    # Convert words to indices
+    seq = [vocab.get(word, vocab.get("<UNK>", 1)) for word in tokens]
+    
+    # Truncate or Pad
+    if len(seq) > MAX_SEQ_LENGTH:
+        seq = seq[:MAX_SEQ_LENGTH]
+    else:
+        seq = seq + [vocab.get("<PAD>", 0)] * (MAX_SEQ_LENGTH - len(seq))
+        
+    tensor_seq = torch.tensor([seq], dtype=torch.long).to(DEVICE)
+    
+    with torch.no_grad():
+        output = model(tensor_seq)
+        probability = output.item()
+        
+    return probability
+
+# ==========================================
+# 3. Streamlit Interface
+# ==========================================
+st.set_page_config(page_title="Deceptive Review Detector", page_icon="🕵️", layout="centered")
+
+st.title("🕵️ Fake Review Detection System")
+st.write("Enter an e-commerce product review below to determine if it is authentic or potentially deceptive/unverified.")
+
+# Load resources once and cache them
+model, vocab = load_model_and_vocab()
+
+if model and vocab:
+    user_input = st.text_area("Review Text:", height=150, placeholder="Type or paste a review here...")
+    
+    if st.button("Analyze Review", type="primary"):
+        if user_input.strip() == "":
+            st.warning("Please enter some text to analyze.")
+        else:
+            with st.spinner("Analyzing..."):
+                prob = predict_review(user_input, model, vocab)
+                
+                # Our proxy method trained Fake/Unverified as 1, Real as 0
+                is_fake = prob >= 0.5
+                
+                st.divider()
+                if is_fake:
+                    st.error(f"🚨 **Flagged as Potentially Deceptive**")
+                    st.write(f"Confidence: **{prob * 100:.2f}%** likelihood of being fake/unverified.")
+                else:
+                    st.success(f"✅ **Flagged as Authentic**")
+                    st.write(f"Confidence: **{(1 - prob) * 100:.2f}%** likelihood of being real.")
