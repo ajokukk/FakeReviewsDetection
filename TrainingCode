@@ -1,0 +1,390 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, ConfusionMatrixDisplay, roc_curve, auc
+from collections import Counter
+import re
+import string
+import matplotlib.pyplot as plt
+import json
+
+# ==========================================
+# 1. Configuration & Hyperparameters
+# ==========================================
+class Config:
+    # File Paths
+    DATA_PATH = "Amazon_Review_Manipulation_Dataset.csv" 
+    GLOVE_PATH = "glove.6B.50d.txt"     
+    
+    # Target dataset size to prevent out-of-memory errors
+    SAMPLE_SIZE = 50000 
+    
+    # Model & Training Params
+    EMBEDDING_DIM = 50
+    MAX_SEQ_LENGTH = 150 
+    BATCH_SIZE = 32
+    HIDDEN_DIM = 128
+    NUM_LAYERS = 2
+    DROPOUT = 0.5
+    LEARNING_RATE = 0.001
+    EPOCHS = 10
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ==========================================
+# 2. Data Preprocessing & Loading
+# ==========================================
+def clean_text(text):
+    text = str(text).lower() 
+    text = re.sub(f'[{re.escape(string.punctuation)}]', '', text) 
+    text = re.sub(r'\s+', ' ', text).strip() 
+    return text
+
+def build_vocab(texts, min_freq=2):
+    counter = Counter()
+    for text in texts:
+        counter.update(text.split())
+        
+    vocab = {"<PAD>": 0, "<UNK>": 1}
+    idx = 2
+    for word, freq in counter.items():
+        if freq >= min_freq:
+            vocab[word] = idx
+            idx += 1
+    return vocab
+
+def load_glove(vocab, glove_path, embed_dim):
+    print("Loading GloVe embeddings...")
+    embeddings_index = {}
+    with open(glove_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            values = line.split()
+            word = values[0]
+            coefs = np.asarray(values[1:], dtype='float32')
+            embeddings_index[word] = coefs
+
+    embedding_matrix = np.zeros((len(vocab), embed_dim))
+    for word, i in vocab.items():
+        embedding_vector = embeddings_index.get(word)
+        if embedding_vector is not None:
+            embedding_matrix[i] = embedding_vector
+        else:
+            embedding_matrix[i] = np.random.normal(scale=0.6, size=(embed_dim,))
+            
+    embedding_matrix[0] = np.zeros(embed_dim)
+    return torch.FloatTensor(embedding_matrix)
+
+# ==========================================
+# 3. Dataset Preparation
+# ==========================================
+class ReviewDataset(Dataset):
+    def __init__(self, texts, labels, vocab, max_len):
+        self.texts = texts
+        self.labels = labels
+        self.vocab = vocab
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = self.texts[idx].split()
+        seq = [self.vocab.get(word, self.vocab["<UNK>"]) for word in text]
+        if len(seq) > self.max_len:
+            seq = seq[:self.max_len]
+        return torch.tensor(seq, dtype=torch.long), torch.tensor(self.labels[idx], dtype=torch.float32)
+
+def collate_fn(batch):
+    sequences, labels = zip(*batch)
+    padded_seqs = pad_sequence(sequences, batch_first=True, padding_value=0)
+    return padded_seqs, torch.stack(labels)
+
+# ==========================================
+# 4. Model Definition
+# ==========================================
+class DeceptiveReviewLSTM(nn.Module):
+    def __init__(self, embedding_matrix, hidden_dim, num_layers, dropout):
+        super(DeceptiveReviewLSTM, self).__init__()
+        
+        vocab_size = embedding_matrix.size(0)
+        embed_dim = embedding_matrix.size(1)
+        
+        self.embedding = nn.Embedding.from_pretrained(embedding_matrix, freeze=False) 
+        
+        self.lstm = nn.LSTM(
+            input_size=embed_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=True 
+        )
+        
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_dim * 2, 1) 
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        embedded = self.embedding(x)
+        lstm_out, _ = self.lstm(embedded)
+        out = lstm_out[:, -1, :] 
+        out = self.dropout(out)
+        out = self.fc(out)
+        return self.sigmoid(out).squeeze()
+
+# ==========================================
+# 5. Plotting Functions
+# ==========================================
+def plot_metrics(train_losses, val_losses, val_accuracies):
+    epochs = range(1, len(train_losses) + 1)
+    
+    plt.figure(figsize=(12, 5))
+    
+    # Plot Loss
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, train_losses, 'b-', label='Training Loss')
+    plt.plot(epochs, val_losses, 'r-', label='Validation Loss')
+    plt.title('Training vs Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    
+    # Plot Accuracy
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, val_accuracies, 'g-', label='Validation Accuracy')
+    plt.title('Validation Accuracy Over Epochs')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig('training_history_plots.png') 
+    plt.show() 
+
+def generate_final_reports(model, dataloader, device):
+    print("\nGenerating final Evaluation Reports (Confusion Matrix & ROC)...")
+    model.eval()
+    all_preds = []
+    all_labels = []
+    all_probs = []
+    
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            
+            probs = outputs.cpu().numpy()
+            preds = (outputs >= 0.5).float().cpu().numpy()
+            
+            all_probs.extend(probs)
+            all_preds.extend(preds)
+            all_labels.extend(labels.cpu().numpy())
+            
+    # --- 1. Confusion Matrix ---
+    cm = confusion_matrix(all_labels, all_preds)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Real (0)', 'Fake/Unverified (1)'])
+    
+    fig, ax = plt.subplots(figsize=(6,6))
+    disp.plot(cmap=plt.cm.Blues, ax=ax)
+    plt.title('Confusion Matrix')
+    plt.savefig('confusion_matrix.png', dpi=300)
+    plt.show()
+    
+    # --- 2. ROC-AUC Curve ---
+    fpr, tpr, _ = roc_curve(all_labels, all_probs)
+    roc_auc = auc(fpr, tpr)
+    
+    plt.figure(figsize=(8, 6))
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.3f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic (ROC)')
+    plt.legend(loc="lower right")
+    plt.savefig('roc_curve.png', dpi=300)
+    plt.show()
+
+# ==========================================
+# 6. Training & Evaluation Loops
+# ==========================================
+def evaluate(model, dataloader, criterion, device):
+    model.eval()
+    total_loss = 0
+    all_preds = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item()
+            
+            preds = (outputs >= 0.5).float()
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            
+    avg_loss = total_loss / len(dataloader)
+    acc = accuracy_score(all_labels, all_preds)
+    prec = precision_score(all_labels, all_preds, zero_division=0)
+    rec = recall_score(all_labels, all_preds, zero_division=0)
+    f1 = f1_score(all_labels, all_preds, zero_division=0)
+    
+    return avg_loss, acc, prec, rec, f1
+
+def train():
+    print(f"Using device: {Config.DEVICE}")
+    
+    # 1. Load Data
+    try:
+        print(f"Loading dataset from {Config.DATA_PATH}...")
+        df = pd.read_csv(Config.DATA_PATH, low_memory=False)
+    except FileNotFoundError:
+        print(f"Error: Could not find {Config.DATA_PATH}.")
+        return
+
+    text_col = 'reviewText' 
+    if text_col not in df.columns or 'verifiedPurchase' not in df.columns:
+        print(f"Error: Required columns not found. Found: {df.columns.tolist()}")
+        return
+
+    df = df.dropna(subset=[text_col, 'verifiedPurchase'])
+
+    # ========================================================
+    # Robust Proxy Method for Labels
+    # ========================================================
+    print("\nInspecting 'verifiedPurchase' column values...")
+    print(df['verifiedPurchase'].value_counts(dropna=False))
+
+    # This catches 'False', 'false', 'N', 'n', '0', 'No'
+    fake_indicators = ['false', 'n', 'no', '0']
+    
+    # Apply the logic: 1 (Fake proxy) if unverified, 0 (Real) if verified
+    df['label'] = df['verifiedPurchase'].apply(
+        lambda x: 1 if str(x).strip().lower() in fake_indicators else 0
+    )
+    label_col = 'label'
+    
+    df['full_text'] = df['reviewTitle'].fillna('') + ' ' + df[text_col]
+
+    # Downsampling Logic
+    if len(df) > Config.SAMPLE_SIZE:
+        print(f"\nDownsampling from {len(df)} to {Config.SAMPLE_SIZE} records...")
+        
+        class_counts = df[label_col].value_counts()
+        print(f"New label distribution before downsampling:\n{class_counts}")
+        
+        # Safety Check
+        if len(class_counts) < 2:
+            print("\n🚨 CRITICAL ERROR: Only one class found!")
+            print("This means every single review in your CSV is marked as a 'Verified Purchase'.")
+            print("The model cannot learn without both examples (0s and 1s).")
+            return
+            
+        fraction_to_keep = Config.SAMPLE_SIZE / len(df)
+        _, df = train_test_split(
+            df, 
+            test_size=fraction_to_keep, 
+            stratify=df[label_col], 
+            random_state=42
+        )
+        print("Downsampling complete.")
+
+    print("Cleaning text data...")
+    df['clean_text'] = df['full_text'].apply(clean_text)
+    
+    texts = df['clean_text'].tolist()
+    labels = df[label_col].astype(int).tolist()
+    
+    # 2. Build Vocabulary and Load Embeddings
+    vocab = build_vocab(texts)
+    print(f"Vocabulary size: {len(vocab)}")
+    
+    with open('vocab.json', 'w') as f:
+        json.dump(vocab, f)
+    
+    try:
+        embedding_matrix = load_glove(vocab, Config.GLOVE_PATH, Config.EMBEDDING_DIM)
+    except FileNotFoundError:
+        print(f"Error: Could not find {Config.GLOVE_PATH}.")
+        return
+        
+    # 3. Create Datasets and DataLoaders
+    X_train, X_val, y_train, y_val = train_test_split(texts, labels, test_size=0.2, random_state=42)
+    
+    train_dataset = ReviewDataset(X_train, y_train, vocab, Config.MAX_SEQ_LENGTH)
+    val_dataset = ReviewDataset(X_val, y_val, vocab, Config.MAX_SEQ_LENGTH)
+    
+    train_loader = DataLoader(train_dataset, batch_size=Config.BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=Config.BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+    
+    # 4. Initialize Model, Loss, and Optimizer
+    model = DeceptiveReviewLSTM(
+        embedding_matrix, 
+        Config.HIDDEN_DIM, 
+        Config.NUM_LAYERS, 
+        Config.DROPOUT
+    ).to(Config.DEVICE)
+    
+    criterion = nn.BCELoss() 
+    optimizer = torch.optim.Adam(model.parameters(), lr=Config.LEARNING_RATE)
+    
+    history_train_loss = []
+    history_val_loss = []
+    history_val_acc = []
+
+    # 5. Training Loop
+    print("\nStarting Training...")
+    best_val_loss = float('inf')
+    
+    for epoch in range(Config.EPOCHS):
+        model.train()
+        total_train_loss = 0
+        
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(Config.DEVICE), labels.to(Config.DEVICE)
+            
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            total_train_loss += loss.item()
+            
+        avg_train_loss = total_train_loss / len(train_loader)
+        
+        val_loss, val_acc, val_prec, val_rec, val_f1 = evaluate(model, val_loader, criterion, Config.DEVICE)
+        
+        history_train_loss.append(avg_train_loss)
+        history_val_loss.append(val_loss)
+        history_val_acc.append(val_acc)
+        
+        print(f"Epoch [{epoch+1}/{Config.EPOCHS}]")
+        print(f"  Train Loss: {avg_train_loss:.4f}")
+        print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | F1: {val_f1:.4f}")
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), 'best_model.pth')
+            print("  [*] Model saved.")
+            
+    print("\nTraining complete. Generating plots...")
+    plot_metrics(history_train_loss, history_val_loss, history_val_acc)
+    
+    try:
+        model.load_state_dict(torch.load('best_model.pth'))
+        generate_final_reports(model, val_loader, Config.DEVICE)
+    except Exception as e:
+        print(f"Could not generate final ROC/CM reports: {e}")
+
+if __name__ == "__main__":
+    train()
